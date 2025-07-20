@@ -1,0 +1,787 @@
+<template>
+  <div class="container">
+    <!-- 顶部标题 -->
+    <div class="header" onclick="toggleMenu">
+      <text class="title">BandBooru</text>
+      <text class="page-indicator">第 {{ currentPage }} 页</text>
+    </div>
+
+    <div class="menu" if="openMenu">
+      <text class="menu-item" onclick="togglePageSize">切换每页图片数</text>
+      <text class="menu-item" onclick="toggleImageSource">查看本地/网络图片</text>
+      <text class="menu-item" onclick="toggleProxy">切换代理</text>
+      <!-- 缓存管理 -->
+      <text class="menu-item" onclick="toggleCacheSize">
+        缓存: {{ cacheSizes[cacheSizeIndex] }}
+      </text>
+      <text class="menu-item" onclick="startCaching" if="{{!isCaching}}">开始缓存</text>
+      <text class="menu-item" if="{{isCaching}}">
+        缓存中({{ cachedCount }}/{{ cacheSizes[cacheSizeIndex] }})
+      </text>
+    </div>
+
+    <!-- 图片展示区 -->
+    <div class="waterfall-container">
+      <!-- 左列 -->
+      <div class="waterfall-column">
+        <div class="image-card" for="{{leftPosts}}">
+          <image class="image" 
+          src="{{safeImageUrl($item.preview_url)}}" 
+          onerror="handleImageError($item)"
+          referrerpolicy="no-referrer"
+          style="width: 100%" 
+          show="{{!$item._hide}}"
+          onclick="downloadImage($item.preview_url, $item.tags)"></image>
+          <div class="info-container">
+            <text class="tags">{{ formatTags($item.tags) }}</text>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右列 -->
+      <div class="waterfall-column">
+        <div class="image-card" for="{{rightPosts}}">
+          <image class="image" 
+          src="{{safeImageUrl($item.preview_url)}}" 
+          onerror="handleImageError($item)"
+          referrerpolicy="no-referrer"
+          style="width: 100%" 
+          show="{{!$item._hide}}"
+          onclick="downloadImage($item.preview_url, $item.tags)"></image>
+          <div class="info-container">
+            <text class="tags">{{ formatTags($item.tags) }}</text>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <text class="output">{{ output }}</text>
+
+    <!-- 分页控制 -->
+    <div class="pagination">
+      <text class="page-btn" @click="prevPage" if="{{currentPage > 1}}">上一页</text>
+      <text class="page-btn" @click="nextPage">下一页</text>
+    </div>
+  </div>
+</template>
+
+<script>
+import router from "@system.router"
+import fetch from "@system.fetch"
+import prompt from "@system.prompt"
+import request from "@system.request"
+
+import file from "@system.file"
+
+export default {
+  private: {
+    leftPosts: [],
+    rightPosts: [],
+    posts: [],
+    currentTags: "",
+    loading: false,
+    sizeOptions: [4, 6, 10, 20, 30],
+    sourceOptions: ["yande.re"],
+    currentSizeIndex: 1,
+    currentSourceIndex: 0,
+    output: "",
+    proxyBase: "http://99z.top/",
+    proxyEnabled: true,
+    openMenu: false,
+    // 缓存相关变量
+    cacheSizes: [50, 100, 200, 400, 500, 1000],
+    cacheSizeIndex: 0,
+    isCaching: false,
+    cachedCount: 0,
+    // 缓存文件直接存储在根目录
+    cacheFilePrefix: "bandbooru_cache_",
+    usingCache: false,
+    // 缓存索引控制
+    cacheFileIndex: 1,
+    // 缓存状态
+    cacheStatus: {
+      total: 0,
+      lastPage: 1
+    },
+    localGallery: [],
+    localGalleryMode: false,
+    downloadDir: "internal://files/bandbooru_downloads/",
+    // 添加图片错误处理状态
+    imageErrorMap: {},
+  },
+  protected: {
+    currentPage: 1
+  },
+
+  onInit() {
+    this.checkCache()
+  },
+
+
+
+  safeImageUrl(url) {
+    if (!url) return "";
+    // 本地路径直接返回
+    if (url.startsWith("internal://") || url.startsWith("file://")) {
+      return url;
+    }
+    
+    // 网络图片添加代理前缀
+    if (url.startsWith("http")) {
+      return this.proxyEnabled ? `${this.proxyBase}${url}` : url;
+    }
+    
+    // 其他情况返回空
+    return "";
+  },
+
+    // 图片加载错误处理
+    handleImageError(item) {
+    // 标记该图片加载失败
+    item._hide = true;
+    // 记录错误次数
+    const key = item.id || item.file_url;
+    this.imageErrorMap[key] = (this.imageErrorMap[key] || 0) + 1;
+    
+    // 错误超过3次则永久隐藏
+    if (this.imageErrorMap[key] > 3) {
+      item._permanentHide = true;
+    }
+    
+  },
+
+
+  checkCache() {
+    // 列出根目录所有文件
+    file.list({
+      uri: "internal://files/",
+      success: (res) => {
+        // 检查是否有缓存文件
+        const hasCache = res.fileList.some(file => 
+          file.uri.includes(this.cacheFilePrefix)
+        )
+        
+        if (hasCache) {
+          this.usingCache = true
+          this.loadCacheStatus().then(() => {
+            this.loadFromCache()
+          })
+        } else {
+          this.usingCache = false
+          this.loadPosts()
+        }
+      },
+      fail: () => {
+        this.usingCache = false
+        this.loadPosts()
+      }
+    })
+  },
+
+  loadCacheStatus() {
+    return new Promise((resolve) => {
+      const statusFile = `internal://files/${this.cacheFilePrefix}status.json`
+      
+      file.readText({
+        uri: statusFile,
+        success: (res) => {
+          try {
+            this.cacheStatus = JSON.parse(res.text)
+            // 计算最大缓存文件索引
+            const maxIndex = this.cacheStatus.total
+            this.cacheFileIndex = maxIndex + 1
+          } catch (e) {
+            this.cacheStatus = { total: 0, lastPage: 1 }
+          }
+          resolve()
+        },
+        fail: () => {
+          this.cacheStatus = { total: 0, lastPage: 1 }
+          resolve()
+        }
+      })
+    })
+  },
+
+  saveCacheStatus() {
+    const statusFile = `internal://files/${this.cacheFilePrefix}status.json`
+    
+    file.writeText({
+      uri: statusFile,
+      text: JSON.stringify({
+        total: this.cachedCount,
+        lastPage: Math.ceil(this.cachedCount / this.sizeOptions[this.currentSizeIndex])
+      })
+    })
+  },
+
+  loadPosts() {
+    if (this.loading) return
+
+    this.loading = true
+    this.posts = []
+    prompt.showToast({ message: "加载中", duration: 2000 })
+
+    const pageSize = this.sizeOptions[this.currentSizeIndex]
+    const apiUrl = `http://${
+      this.sourceOptions[this.currentSourceIndex]
+    }/post.json?limit=${pageSize}&page=${this.currentPage}&tags=${encodeURIComponent(
+      this.currentTags
+    )}`
+
+    fetch.fetch({
+      url: apiUrl,
+      responseType: "text",
+      success: (res) => {
+        if (res.code === 200) {
+          try {
+            const data = JSON.parse(res.data)
+            const processedData = data.slice(0, pageSize).map((item) => ({
+              ...item,
+              preview_url: item.preview_url
+            }))
+
+            this.leftPosts = processedData.filter((_, i) => i % 2 === 0)
+            this.rightPosts = processedData.filter((_, i) => i % 2 === 1)
+
+            prompt.showToast({
+              message: `加载${processedData.length}张图片`,
+              duration: 3000
+            })
+          } catch (e) {
+            prompt.showToast({ message: "数据解析失败:" + e, duration: 2000 })
+          }
+        } else {
+          prompt.showToast({ message: `API错误: ${res.code}`, duration: 2000 })
+        }
+        this.loading = false
+      },
+      fail: (err, code) => {
+        prompt.showToast({ message: `请求失败: ${code}`, duration: 2000 })
+        this.loading = false
+        if (this.usingCache) {
+          this.loadFromCache()
+        }
+      }
+    })
+  },
+
+  loadFromCache() {
+    // 列出根目录所有文件
+    file.list({
+      uri: "internal://files/",
+      success: (res) => {
+        // 获取所有缓存文件并按索引排序
+        const allFiles = (res.fileList || [])
+          .filter(file => 
+            file.uri.includes(this.cacheFilePrefix) && 
+            file.uri.endsWith('.json') &&
+            !file.uri.includes('status.json')
+          )
+          .sort((a, b) => a.uri.localeCompare(b.uri))
+
+        const pageSize = this.sizeOptions[this.currentSizeIndex]
+        const startIndex = (this.currentPage - 1) * pageSize
+        const endIndex = startIndex + pageSize
+
+        // 检查是否超出缓存范围
+        if (startIndex >= this.cacheStatus.total) {
+          this.leftPosts = []
+          this.rightPosts = []
+          prompt.showToast({ message: "已到达缓存末尾", duration: 1000 })
+          return
+        }
+
+        // 当前页的文件范围
+        const currentPageFiles = allFiles.slice(startIndex, endIndex)
+
+        const loadPromises = currentPageFiles.map((fileInfo) => {
+          return new Promise((resolve) => {
+            file.readText({
+              uri: fileInfo.uri,
+              success: (res) => {
+                try {
+                  resolve(JSON.parse(res.text))
+                } catch (e) {
+                  resolve(null)
+                }
+              },
+              fail: () => resolve(null)
+            })
+          })
+        })
+
+        Promise.all(loadPromises).then((data) => {
+          const validData = data.filter((item) => item !== null)
+          this.leftPosts = validData.filter((_, i) => i % 2 === 0)
+          this.rightPosts = validData.filter((_, i) => i % 2 === 1)
+          
+          if (validData.length === 0) {
+            prompt.showToast({ message: "无缓存数据", duration: 1000 })
+          } else {
+            prompt.showToast({
+              message: `加载缓存 ${startIndex + 1}-${Math.min(startIndex + pageSize, this.cacheStatus.total)}/${this.cacheStatus.total}`,
+              duration: 2000
+            })
+          }
+        })
+      },
+      fail: () => {
+        prompt.showToast({ message: "缓存读取失败", duration: 1000 })
+      }
+    })
+  },
+
+  toggleCacheSize() {
+    this.cacheSizeIndex = (this.cacheSizeIndex + 1) % this.cacheSizes.length
+    prompt.showToast({
+      message: `缓存数量: ${this.cacheSizes[this.cacheSizeIndex]}`,
+      duration: 1000
+    })
+  },
+
+  startCaching() {
+    if (this.isCaching) return
+
+    this.isCaching = true
+    this.cachedCount = 0
+    this.targetCount = this.cacheSizes[this.cacheSizeIndex]
+    this.currentCachePage = 1
+    this.cacheFileIndex = 1
+
+    this.cacheNextPage()
+  },
+
+  cacheNextPage() {
+    if (this.cachedCount >= this.targetCount) {
+      this.finishCaching()
+      return
+    }
+
+    const perPage = Math.min(100, this.targetCount - this.cachedCount)
+    const apiUrl = `http://${this.sourceOptions[this.currentSourceIndex]}/post.json?page=${
+      this.currentCachePage
+    }&limit=${perPage}`
+
+    fetch.fetch({
+      url: apiUrl,
+      responseType: "text",
+      success: (res) => {
+        if (res.code === 200) {
+          try {
+            const data = JSON.parse(res.data)
+            if (!Array.isArray(data)) {
+              throw new Error("响应数据不是数组")
+            }
+
+            if (data.length === 0) {
+              this.finishCaching()
+              return
+            }
+
+            // 保存每张图片到单独文件
+            const savePromises = data.map((post) => {
+              return new Promise((resolve) => {
+                // 在根目录创建缓存文件
+                const cacheFile = `internal://files/${this.cacheFilePrefix}${String(this.cacheFileIndex).padStart(6, '0')}.json`
+                this.cacheFileIndex++
+
+                file.writeText({
+                  uri: cacheFile,
+                  text: JSON.stringify(post),
+                  success: () => {
+                    this.cachedCount++
+                    resolve(true)
+                  },
+                  fail: () => resolve(false)
+                })
+              })
+            })
+
+            Promise.all(savePromises).then(() => {
+              this.currentCachePage++
+              prompt.showToast({
+                message: `已缓存 ${this.cachedCount}/${this.targetCount}`,
+                duration: 500
+              })
+
+              if (this.cachedCount < this.targetCount) {
+                this.cacheNextPage()
+              } else {
+                this.finishCaching()
+              }
+            })
+          } catch (e) {
+            prompt.showToast({
+              message: `数据解析失败: ${e.message}`,
+              duration: 3000
+            })
+            this.isCaching = false
+          }
+        } else {
+          prompt.showToast({
+            message: `API错误: ${res.code}`,
+            duration: 2000
+          })
+          this.isCaching = false
+        }
+      },
+      fail: (err, code) => {
+        prompt.showToast({
+          message: `请求失败: ${code}`,
+          duration: 2000
+        })
+        this.isCaching = false
+      }
+    })
+  },
+
+  finishCaching() {
+    this.isCaching = false
+    this.usingCache = true
+    this.cacheStatus = {
+      total: this.cachedCount,
+      lastPage: Math.ceil(this.cachedCount / this.sizeOptions[this.currentSizeIndex])
+    }
+    this.saveCacheStatus()
+    
+    prompt.showToast({
+      message: `缓存完成: ${this.cachedCount}张图片`,
+      duration: 3000
+    })
+    this.currentPage = 1
+    this.loadFromCache()
+  },
+
+  toggleMenu() {
+    this.openMenu = !this.openMenu
+  },
+
+  togglePageSize() {
+    this.currentSizeIndex = (this.currentSizeIndex + 1) % this.sizeOptions.length
+    prompt.showToast({
+      message: `每页${this.sizeOptions[this.currentSizeIndex]}张图`,
+      duration: 1000
+    })
+    this.currentPage = 1
+    if (this.usingCache) {
+      this.loadFromCache()
+    } else {
+      this.loadPosts()
+    }
+  },
+
+
+  toggleProxy() {
+    this.proxyEnabled = !this.proxyEnabled
+    prompt.showToast({
+      message: `代理已${this.proxyEnabled ? "开启" : "关闭"}`,
+      duration: 1000
+    })
+
+    if (this.usingCache) {
+      this.loadFromCache()
+    } else {
+      this.loadPosts()
+    }
+  },
+
+  formatTags(tags) {
+    const tagList = tags.split(" ")
+    if (tagList.length > 5) {
+      return tagList.slice(0, 5).join(", ")
+    }
+    return tagList.join(", ")
+  },
+
+  prevPage() {
+    if (this.currentPage > 1) {
+      this.currentPage--
+      if (this.usingCache) {
+        this.loadFromCache()
+      } else {
+        this.loadPosts()
+      }
+    }
+  },
+
+  nextPage() {
+    if (this.usingCache) {
+      const maxPage = Math.ceil(this.cacheStatus.total / this.sizeOptions[this.currentSizeIndex])
+      if (this.currentPage >= maxPage) {
+        prompt.showToast({ message: "已是最后一页", duration: 1000 })
+        return
+      }
+    }
+    this.currentPage++
+    if (this.usingCache) {
+      this.loadFromCache()
+    } else {
+      this.loadPosts()
+    }
+  },
+
+  // 下载图片方法
+  // 修改下载图片方法
+  downloadImage(fileUrl, tags) {
+    // 添加内存检查
+    const url = this.safeImageUrl(fileUrl);
+    const filename = `${new Date().getTime()}.jpg`; // 使用时间戳作为文件名
+    
+    // 确保下载目录存在
+    file.mkdir({
+      uri: this.downloadDir,
+      success: () => {
+        this.startDownload(url, filename, tags);
+      },
+      fail: () => {
+        prompt.showToast({ message: "创建目录失败", duration: 1000 });
+      }
+    });
+  },
+
+  startDownload(url, filename, tags) {
+    prompt.showToast({ message: "开始下载...", duration: 1000 });
+    
+    request.download({
+      url: url,
+      filename: `${this.downloadDir}${filename}`,
+      success: (data) => {
+        const token = data.token;
+        
+        request.onDownloadComplete({
+          token: token,
+          success: (res) => {
+            // 保存图片信息到本地图库
+            this.saveImageInfo(filename, tags, res.uri);
+            prompt.showToast({ message: "下载成功", duration: 2000 });
+          },
+          fail: (err, code) => {
+            prompt.showToast({ message: `下载失败: ${code}`, duration: 2000 });
+          }
+        });
+      },
+      fail: (err, code) => {
+        prompt.showToast({ message: `下载请求失败: ${code}`, duration: 2000 });
+      }
+    });
+  },
+
+  // 保存图片信息
+  saveImageInfo(filename, tags, uri) {
+    const imageInfo = {
+      filename: filename,
+      tags: tags,
+      uri: uri,
+      date: new Date().toLocaleString()
+    };
+    
+    // 读取已有图库
+    file.readText({
+      uri: `${this.downloadDir}gallery.json`,
+      success: (res) => {
+        try {
+          const gallery = JSON.parse(res.text);
+          gallery.push(imageInfo);
+          this.updateGallery(gallery);
+        } catch (e) {
+          this.updateGallery([imageInfo]);
+        }
+      },
+      fail: () => {
+        this.updateGallery([imageInfo]);
+      }
+    });
+  },
+
+  // 更新图库文件
+  updateGallery(gallery) {
+    file.writeText({
+      uri: `${this.downloadDir}gallery.json`,
+      text: JSON.stringify(gallery),
+      success: () => {
+        this.localGallery = gallery;
+      }
+    });
+  },
+
+  // 切换图库模式
+  toggleImageSource() {
+    this.localGalleryMode = !this.localGalleryMode;
+    
+    if (this.localGalleryMode) {
+      this.loadLocalGallery();
+      prompt.showToast({ message: "切换到本地图库", duration: 1000 });
+    } else {
+      this.loadPosts();
+      prompt.showToast({ message: "切换到网络图库", duration: 1000 });
+    }
+  },
+
+  // 修改本地图库加载方法
+  loadLocalGallery() {
+    // 先释放现有资源
+    this.leftPosts = [];
+    this.rightPosts = [];
+    
+    file.readText({
+      uri: `${this.downloadDir}gallery.json`,
+      success: (res) => {
+        try {
+          const gallery = JSON.parse(res.text) || [];
+          this.localGallery = gallery;
+          
+          // 分页加载
+          const pageSize = Math.min(
+            this.sizeOptions[this.currentSizeIndex], 
+            10 // 限制最大10张
+          );
+          const start = (this.currentPage - 1) * pageSize;
+          const end = start + pageSize;
+          const pageData = gallery.slice(start, end);
+          
+          // 处理数据并添加安全字段
+          const processedData = pageData.map(item => ({
+            ...item,
+            preview_url: item.uri,
+            file_url: item.uri,
+            _hide: false
+          }));
+          
+          // 分割为左右两列
+          this.leftPosts = processedData.filter((_, i) => i % 2 === 0);
+          this.rightPosts = processedData.filter((_, i) => i % 2 === 1);
+          
+          prompt.showToast({ 
+            message: `加载${processedData.length}张本地图片`, 
+            duration: 2000 
+          });
+        } catch (e) {
+          prompt.showToast({ message: "解析本地图库失败", duration: 1000 });
+        }
+      },
+      fail: () => {
+        prompt.showToast({ message: "无本地图片", duration: 1000 });
+      }
+    });
+  },
+
+  // 修改查看大图方法以支持本地图片
+  viewImage(imageUrl) {
+    // 如果是本地图库模式，直接使用URI
+    const uri = this.localGalleryMode ? imageUrl : this.getImageUrl(imageUrl);
+    
+    router.push({
+      uri: "pages/bigimage",
+      params: {
+        ___PARAM_LAUNCH_FLAG___: "clearTask",
+        uri: uri
+      }
+    });
+  },
+}
+</script>
+
+<style>
+.container {
+  width: 100%;
+  height: 100%;
+  background-color: #000;
+  flex-direction: column;
+  padding: 10px;
+}
+
+.header {
+  height: 40px;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: bold;
+  color: #fff;
+}
+
+.page-indicator {
+  font-size: 15px;
+  color: #888;
+}
+
+.pagination {
+  padding: 0 50px;
+  height: 36px;
+  flex-direction: row;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.page-btn {
+  height: 36px;
+  width: 100px;
+  background-color: #2a2a2a;
+  font-size: 20px;
+  color: #e0e0e0;
+  text-align: center;
+  border-radius: 4px;
+}
+
+.menu {
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.menu-item {
+  width: 160px;
+  font-size: 18px;
+  background-color: #2a2a2a;
+  color: #e0e0e0;
+  text-align: center;
+  padding: 10px 5px;
+  margin: 5px 10px;
+  border-radius: 4px;
+}
+
+.waterfall-container {
+  flex-direction: row;
+  justify-content: space-between;
+}
+
+.waterfall-column {
+  width: 49%;
+  flex-direction: column;
+}
+
+.image-card {
+  width: 100%;
+  background-color: #1e1e1e;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  flex-direction: column;
+}
+
+.image {
+  width: 100%;
+  object-fit: contain;
+  border-radius: 6px 6px 0 0;
+}
+
+.info-container {
+  padding: 8px;
+}
+
+.tags {
+  font-size: 14px;
+  color: #bbb;
+  height: 40px;
+}
+
+.output {
+  font-size: 14px;
+  color: #bbb;
+}
+</style>

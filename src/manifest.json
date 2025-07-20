@@ -1,0 +1,49 @@
+{
+  "package": "moe.orpu.bandbooru",
+  "name": "BandBooru",
+  "versionName": "1.0.0",
+  "versionCode": 1,
+  "minPlatformVersion": 1000,
+  "icon": "/common/logo.png",
+  "deviceTypeList": [
+    "watch"
+  ],
+  "features": [
+    {
+      "name": "system.router"
+    },
+    {
+      "name": "system.fetch"
+    },
+    {
+      "name": "system.prompt"
+    },
+    {
+      "name": "system.device"
+    },
+    {
+      "name": "system.file"
+    },
+    {
+      "name": "system.request"
+    }
+  ],
+  "config": {
+    "logLevel": "log",
+    "designWidth": 466
+  },
+  "router": {
+    "entry": "pages/index",
+    "pages": {
+      "pages/index": {
+        "component": "index"
+      },
+      "pages/detail": {
+        "component": "detail"
+      },
+      "pages/bigimage": {
+        "component": "bigimage"
+      }
+    }
+  }
+}
